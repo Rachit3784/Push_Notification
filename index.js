@@ -1,6 +1,7 @@
 const express = require('express');
 const admin = require('firebase-admin');
 const cors = require('cors');
+const { router } = require('./routes');
 require('dotenv').config();
 
 const app = express();
@@ -17,6 +18,7 @@ admin.initializeApp({
 
 const db = admin.firestore();
 
+app.use('/call', router); // Mount routes from routes.js
 // 2. The Endpoint (Matches your 'send-notification' path)
 app.post('/send-notification', async (req, res) => {
   try {
