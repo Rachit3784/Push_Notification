@@ -1,6 +1,5 @@
 const express = require('express');
-const admin = require('firebase-admin');
-const { handleUserCallRequest, confirmReceipt } = require('./CallController');
+const { handleUserCallRequest, confirmReceipt, handleCallCancel } = require('./CallController');
 
 const router = express.Router();
 
@@ -9,5 +8,8 @@ router.post('/request', handleUserCallRequest);
 
 // Acknowledgement Endpoint
 router.post('/confirm-receipt', confirmReceipt);
+
+// Cancellation Signal Endpoint
+router.post('/cancel', handleCallCancel);
 
 module.exports = { router };

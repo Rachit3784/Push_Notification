@@ -7,21 +7,15 @@
 const admin = require('firebase-admin');
 
 // In-memory object to track 10s Acknowledgement timers
-const pendingCalls = {}; 
+const pendingCalls = {};
 
 /**
- * PHASE 2: Process Call Request
- * - Performs Busy Validation (with 2-minute "Zombie" cleanup logic)
- * - Fetches FCM token
- * - Dispatches High-Priority Data-Only Message
- * - Starts 10-second Gatekeeper Timer
+ * 1. Process Call Request
  */
 const handleUserCallRequest = async (req, res) => {
   const { callId, senderId, senderName, receiverId, timestamp } = req.body;
 
   try {
-    // 1. ADVANCED BUSY VALIDATION (Zombie Check)
-    // Check if the Receiver is involved in any active doc (as either role)
     const [asReceiver, asCaller] = await Promise.all([
       admin.firestore().collection('calls')
         .where('receiverId', '==', receiverId)
@@ -34,29 +28,25 @@ const handleUserCallRequest = async (req, res) => {
     ]);
 
     const now = Date.now();
-    // A document is considered "Zombie" (stale) if it's older than 2 minutes 
-    // and hasn't moved to 'ended/cancelled'
-    const isRecent = (doc) => (now - (doc.data().initiationTimestamp || 0)) < 120000; 
+    const isRecent = (doc) => (now - (doc.data().initiationTimestamp || 0)) < 120000;
 
-    const trulyBusy = 
-      asReceiver.docs.some(doc => doc.id !== callId && isRecent(doc)) || 
+    const trulyBusy =
+      asReceiver.docs.some(doc => doc.id !== callId && isRecent(doc)) ||
       asCaller.docs.some(doc => doc.id !== callId && isRecent(doc));
 
     if (trulyBusy) {
-      console.log(`Call Blocked: User ${receiverId} is occupied.`);
+      // console.log(`[CallRequest] Blocked: User ${receiverId} is occupied.`);
       return res.status(200).json({ status: 'busy', message: 'User is on another call' });
     }
 
-    // 2. FETCH FCM TOKEN
     const userDoc = await admin.firestore().collection('users').doc(receiverId).get();
     const receiverFcmToken = userDoc.data()?.userIdFCMtoken;
 
     if (!receiverFcmToken) {
-        console.log(`Call Blocked: User ${receiverId} is offline (No token).`);
-        return res.status(200).json({ status: 'offline', message: 'No token found' });
+      // console.log(`[CallRequest] Blocked: User ${receiverId} has no FCM token.`);
+      return res.status(200).json({ status: 'offline', message: 'User token missing' });
     }
 
-    // 3. DATA-ONLY FCM DISPATCH (Phase 2)
     const message = {
       data: {
         type: 'INCOMING_CALL',
@@ -65,26 +55,17 @@ const handleUserCallRequest = async (req, res) => {
         initiationTimestamp: (timestamp || Date.now()).toString(),
       },
       token: receiverFcmToken,
-      android: { 
-        priority: 'high',
-        ttl: 10000 // 10s TTL for the message delivery
-      }
+      android: { priority: 'high', ttl: 10000 }
     };
 
     await admin.messaging().send(message);
+    // console.log(`[CallRequest] Signaling sent for ${callId}.`);
 
-    // 4. START 10-SECOND GATEKEEPER TIMER (Phase 2)
-    pendingCalls[callId] = false; 
-
+    pendingCalls[callId] = false;
     setTimeout(async () => {
-      // If 10s pass without acknowledgement (confirm-receipt hit)
       if (pendingCalls[callId] === false) {
-        console.log(`Call ${callId} Gatekeeper: User unavailable (Timeout).`);
-        
-        await admin.firestore().collection('calls').doc(callId).update({
-          status: 'user_unavailable'
-        });
-
+        // console.log(`[CallRequest] Gatekeeper: Call ${callId} timed out.`);
+        await admin.firestore().collection('calls').doc(callId).update({ status: 'user_unavailable' });
         delete pendingCalls[callId];
       }
     }, 10000);
@@ -92,37 +73,58 @@ const handleUserCallRequest = async (req, res) => {
     return res.status(200).json({ status: 'sent', message: 'Notification triggered' });
 
   } catch (error) {
-    console.error("FCM Controller Error:", error);
+    console.error("[CallRequest] FCM Controller Error:", error);
     res.status(500).json({ error: 'Internal server error' });
   }
 };
 
 /**
- * PHASE 2: Acknowledgement (Confirm Receipt)
- * - Receiver hits this endpoint as soon as FCM arrives
- * - Moves Firestore status from 'initiating' to 'ringing'
- * - Clears the 10s gatekeeper timer
+ * 2. Acknowledgement (Confirm Receipt)
  */
 const confirmReceipt = async (req, res) => {
   try {
     const { callId } = req.body;
-    console.log(`Call ${callId}: Acknowledgement received.`);
-
     if (pendingCalls[callId] !== undefined) {
-      pendingCalls[callId] = true; // Gatekeeper passed
-      
-      await admin.firestore().collection('calls').doc(callId).update({
-        status: 'ringing'
-      });
-      
-      res.status(200).json({ success: true });
+      pendingCalls[callId] = true; 
+      await admin.firestore().collection('calls').doc(callId).update({ status: 'ringing' });
+      // console.log(`[CallAck] Call ${callId} acknowledged.`);
+      return res.status(200).json({ success: true });
     } else {
-      res.status(404).json({ success: false, message: 'Call session expired' });
+      // If session is gone, it's likely already cancelled/ended. No need to error.
+      return res.status(200).json({ success: true, message: 'Session handled' });
     }
   } catch (error) {
-    console.error("Acknowledgement Error:", error);
+    console.error("[CallAck] Error:", error);
     res.status(500).json({ error: 'Internal server error' });
   }
 };
 
-module.exports = { handleUserCallRequest, confirmReceipt };
+/**
+ * 3. Handle Call Cancellation
+ */
+const handleCallCancel = async (req, res) => {
+  const { callId, receiverId } = req.body;
+  try {
+    const userDoc = await admin.firestore().collection('users').doc(receiverId).get();
+    const token = userDoc.data()?.userIdFCMtoken;
+
+    if (token) {
+      const message = {
+        data: { type: 'CALL_CANCELLED', callId: callId },
+        token: token,
+        android: { priority: 'high' }
+      };
+      await admin.messaging().send(message);
+      // console.log(`[CallCancel] Signal sent for ${callId} to ${receiverId}`);
+    }
+    
+    delete pendingCalls[callId];
+    res.status(200).json({ success: true });
+
+  } catch (error) {
+    console.error("[CallCancel] Error:", error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+module.exports = { handleUserCallRequest, confirmReceipt, handleCallCancel };
